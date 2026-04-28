@@ -1,11 +1,14 @@
-import datetime
 import json
 import re
+import shutil
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import requests
 from openhexa.sdk import current_run, workspace
+from openhexa.sdk.datasets.dataset import DatasetVersion
 from rapidfuzz import fuzz, process
 from sqlalchemy import create_engine
 from unidecode import unidecode
@@ -139,7 +142,7 @@ def convert_month_names(data: pd.DataFrame, month_col: str) -> pd.DataFrame:
         raise ColumnMissingError(f"Colonne '{month_col}' est manquante dans les données.")
 
     # Convertime datetime to month
-    data[month_col] = data[month_col].apply(lambda m: m.strftime("%m") if isinstance(m, datetime.datetime) else m)
+    data[month_col] = data[month_col].apply(lambda m: m.strftime("%m") if isinstance(m, datetime) else m)
 
     # Replace numeric month values with French names
     month_mapping = {
@@ -350,3 +353,123 @@ def send_mail(text: str, mailgun_key: str, email_list: list, email_from: str, em
             "text": text,
         },
     )
+
+
+def add_files_to_dataset(
+    dataset_id: str,
+    file_paths: list[Path],
+    ds_version_prefix: str = "DS",
+    ds_desc: str = "Dataset version created by pipeline",
+) -> bool:
+    """Add files to a new dataset version.
+
+    Parameters
+    ----------
+    dataset_id : str
+        The ID of the dataset to which files will be added.
+    file_paths : list[Path]
+        A list of file paths to be added to the dataset.
+    ds_version_prefix : str, optional
+        The prefix for the dataset version name. Default is "DS".
+    ds_desc : str, optional
+        The description for the dataset version. Default is "Dataset version created by pipeline".
+
+    Returns
+    -------
+    bool
+        True if at least one file was added successfully, False otherwise.
+
+    Raises
+    ------
+    ValueError
+        If the dataset ID is not specified.
+    """
+    if not dataset_id:
+        raise ValueError("Dataset ID is not specified.")
+
+    supported_extensions = {".parquet", ".csv", ".geojson", ".json"}
+    added_any = False
+    new_version = None
+
+    for src in file_paths:
+        if not src.exists():
+            current_run.log_warning(f"File not found: {src}")
+            continue
+
+        ext = src.suffix.lower()
+        if ext not in supported_extensions:
+            current_run.log_warning(f"Unsupported file format: {src.name}")
+            continue
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+
+            shutil.copy2(src, tmp_path)
+
+            if not added_any:
+                new_version = get_new_dataset_version(
+                    ds_id=dataset_id,
+                    prefix=ds_version_prefix,
+                    ds_desc=ds_desc,
+                )
+                current_run.log_info(f"New dataset version created: {new_version.name}")
+                added_any = True
+
+            new_version.add_file(str(tmp_path), filename=src.name)
+            current_run.log_info(f"File {src.name} added to dataset version: {new_version.name}")
+
+        except Exception as e:
+            current_run.log_warning(f"File {src.name} cannot be added: {e}")
+
+        finally:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink()
+
+    if not added_any:
+        current_run.log_warning("No valid files found. Dataset version was not created.")
+        return False
+
+    return True
+
+
+def get_new_dataset_version(ds_id: str, prefix: str = "DS", ds_desc: str = "Dataset") -> DatasetVersion:
+    """Create and return a new dataset version.
+
+    Parameters
+    ----------
+    ds_id : str
+        The ID of the dataset for which a new version will be created.
+    prefix : str, optional
+        Prefix for the dataset version name (default is "DS").
+    ds_desc : str, optional
+        Description for the dataset (default is "Dataset version created by pipeline").
+
+    Returns
+    -------
+    DatasetVersion
+        The newly created dataset version.
+
+    Raises
+    ------
+    Exception
+        If an error occurs while creating the new dataset version.
+    """
+    try:
+        dataset = workspace.get_dataset(ds_id)
+    except Exception as e:
+        current_run.log_warning(f"Error retrieving dataset: {ds_id}")
+        current_run.log_debug(f"Error retrieving dataset {ds_id}: {e}")
+        dataset = None
+
+    if dataset is None:
+        current_run.log_warning(f"Creating new Dataset with ID: {ds_id}")
+        dataset = workspace.create_dataset(name=ds_id.replace("-", "_").upper(), description=ds_desc)
+
+    version_name = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M')}"
+
+    try:
+        return dataset.create_version(version_name)
+    except Exception as e:
+        raise Exception("An error occurred while creating the new dataset version.") from e

@@ -5,6 +5,7 @@ from openhexa.sdk import current_run, pipeline, workspace
 from unidecode import unidecode
 from utils import (
     ColumnMissingError,
+    add_files_to_dataset,
     clean_province_series,
     clean_string,
     concat_and_format_table,
@@ -36,8 +37,10 @@ def run_senes_data_loader():
 
     # Save the processed table as a parquet file (per year)
     last_year = senes_data.ANNEE.max()
+    last_week = senes_data[last_year == senes_data.ANNEE]["SE"].max()
     (pipeline_path / "processed").mkdir(parents=True, exist_ok=True)
-    senes_data.to_parquet(pipeline_path / "processed" / f"senes_data_{last_year}.parquet", index=False)
+    file_path = pipeline_path / "processed" / f"senes_data_{last_year}W{last_week}.parquet"
+    senes_data.to_parquet(file_path, index=False)
 
     # push the data to the database
     current_run.log_info("Mise à jour de la table COD_SENES dans la base de données")
@@ -45,6 +48,15 @@ def run_senes_data_loader():
         table_name="COD_SENES",
         dataframe=senes_data,
         db_url=workspace.database_url,
+    )
+
+    # Push new SENES dataset to OpenHexa Dataset
+    current_run.log_info("Pousser les fichiers traités dans le SENES dataset")
+    add_files_to_dataset(
+        dataset_id="senes-dataset",
+        file_paths=[file_path],
+        ds_version_prefix="SENES",
+        ds_desc=f"Mise à jour SENES — année : {last_year}, semaine : {last_week}",
     )
 
     # notify by email
